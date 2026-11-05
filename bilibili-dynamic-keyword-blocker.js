@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站动态关键字屏蔽器
 // @namespace    https://github.com/bubble9um/bilibili-dynamic-keyword-blocker
-// @version      1.0.0
+// @version      1.1.0
 // @description  根据自定义关键字屏蔽/隐藏 B 站动态页面内容。支持实时管理关键字、折叠模式（可手动显示并再次隐藏）、正则匹配、导入导出。兼容 BewlyBewly 改版页面。
 // @author       SPARKGUM
 // @match        https://t.bilibili.com/*
@@ -226,6 +226,11 @@
   }
 
   // ===================== 屏蔽处理 =====================
+  // 卡片上次被判定时的快照（动态 ID + 文本），用来识别「同一条动态内容变化」与「换了另一条动态」
+  const cardSnap = new WeakMap();
+  // 本次会话内点过「显示」的动态 ID → 命中的关键字；刷新页面即清空
+  const allowMap = new Map();
+
   function resetCard(card) {
     card.classList.remove('bili-blocker-hidden', 'bili-blocker-collapsed');
     delete card.dataset.biliBlocked;
@@ -279,9 +284,11 @@
 
   // 点「显示」：展开动态，但保留一条灰色细条，方便再次隐藏
   function revealCard(card) {
-    card.classList.remove('bili-blocker-collapsed');
+    card.classList.remove('bili-blocker-collapsed', 'bili-blocker-hidden');
     delete card.dataset.biliBlocked;
     card.dataset.biliAllow = '1';
+    const id = cardId(card);
+    if (id) allowMap.set(id, card.dataset.biliKw || '');
     if (state.settings.mode === 'collapse') setPlaceholder(card, true);
     updateCount();
   }
@@ -290,8 +297,31 @@
   function hideCard(card) {
     if (!card.dataset.biliKw) return;
     delete card.dataset.biliAllow;
+    const id = cardId(card);
+    if (id) allowMap.delete(id);
     blockCard(card, card.dataset.biliKw);
     updateCount();
+  }
+
+  // 取动态 ID：优先用「发布时间」链接（t.bilibili.com/123 / /opus/123），
+  // 用它来区分「同一条动态内容变了」和「虚拟列表把这个 DOM 节点换成了另一条动态」
+  function cardId(card) {
+    const pick = (href) => {
+      const m = href.match(/\/(?:opus|dynamic)\/(\d{6,})/) || href.match(/t\.bilibili\.com\/(\d{6,})/);
+      return m ? m[1] : '';
+    };
+    const timeLink = card.querySelector(
+      '.bili-dyn-time a[href], [class*="dyn-time"] a[href], [class*="time"] a[href]'
+    );
+    if (timeLink) {
+      const id = pick(timeLink.getAttribute('href') || '');
+      if (id) return id;
+    }
+    for (const a of card.querySelectorAll('a[href]')) {
+      const id = pick(a.getAttribute('href') || '');
+      if (id) return id;
+    }
+    return '';
   }
 
   // 取卡片文本：排除自己插入的占位条，避免「占位条文字 → 内容指纹变化 → 反复重判」的抖动
@@ -316,21 +346,62 @@
     for (const card of cards) {
       const text = cardText(card);
       const s = sig(text);
-      const done = card.dataset.biliBlocked || card.dataset.biliClean || card.dataset.biliAllow;
-      // 虚拟列表会复用同一个 DOM 节点显示不同动态，所以按内容指纹判断是否要重新处理
-      if (!force && done && card.dataset.biliSig === s) {
-        // 手动显示过的卡片：若框架重绘把细条弄丢了，补回来，保证随时能再次隐藏
-        if (card.dataset.biliAllow && state.settings.mode === 'collapse'
-          && !card.querySelector(':scope > .bili-blocker-ph')) {
+      const id = cardId(card);
+
+      // 内容还没渲染出来的空卡片先不判定，等下一轮
+      if (!text && !card.dataset.biliBlocked && !card.dataset.biliAllow) continue;
+
+      // ① 本次会话内被手动「显示」过的动态：一直保持展开。
+      //    只有点「重新隐藏」或刷新页面才会失效（评论加载、展开全文、点任何地方都不影响）。
+      const prev = cardSnap.get(card);
+      // 同一个 DOM 节点被虚拟列表拿去显示另一条动态了（ID 变了）→ 元素上残留的展开标记作废
+      const idChanged = !!(id && prev && prev.id && id !== prev.id);
+      let allowKw;
+      if (card.dataset.biliAllow === '1') {
+        allowKw = (idChanged && !(id && allowMap.has(id)))
+          ? undefined
+          : (card.dataset.biliKw || '');
+      } else {
+        allowKw = (id && allowMap.has(id)) ? allowMap.get(id) : undefined;
+      }
+
+      if (!force && allowKw !== undefined) {
+        card.dataset.biliKw = allowKw;
+        card.dataset.biliAllow = '1';
+        delete card.dataset.biliBlocked;
+        card.classList.remove('bili-blocker-collapsed', 'bili-blocker-hidden');
+        if (state.settings.mode === 'collapse' && !card.querySelector(':scope > .bili-blocker-ph')) {
           setPlaceholder(card, true);
         }
+        card.dataset.biliSig = s;
+        cardSnap.set(card, { id: id, text: text });
         continue;
       }
 
+      // ② 已经判定过，且还是同一条动态（只是内容变多/变少，比如评论区加载）
+      //    → 保持原判，不重新判定，避免「点评论就缩回去」
+      const judged = card.dataset.biliBlocked || card.dataset.biliClean;
+      if (!force && judged && prev) {
+        const sameId = (id && prev.id) ? id === prev.id : null;
+        const sameText = !prev.text || text === prev.text
+          || text.startsWith(prev.text) || prev.text.startsWith(text);
+        if (sameText || sameId === true) {
+          // 屏蔽态下若框架重绘把占位条丢了，补回来
+          if (card.dataset.biliBlocked && state.settings.mode === 'collapse'
+            && !card.querySelector(':scope > .bili-blocker-ph')) {
+            setPlaceholder(card, false);
+          }
+          card.dataset.biliSig = s;
+          cardSnap.set(card, { id: id, text: text });
+          continue;
+        }
+      }
+
+      // ③ 新出现的动态 / 这个节点被复用来显示另一条动态：重新判定
       resetCard(card);
-      // 内容变了说明换了一条动态，之前的「手动显示」不再生效，重新判定
       delete card.dataset.biliAllow;
       card.dataset.biliSig = s;
+      cardSnap.set(card, { id: id, text: text });
 
       const hit = matchKeyword(text);
       if (hit) {
@@ -344,6 +415,7 @@
   }
 
   function rescan() {
+    allowMap.clear();
     document.querySelectorAll('[data-bili-blocked],[data-bili-clean],[data-bili-allow],[data-bili-kw],[data-bili-sig]').forEach(el => {
       resetCard(el);
       delete el.dataset.biliClean;
