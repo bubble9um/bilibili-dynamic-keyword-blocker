@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站动态关键字屏蔽器
 // @namespace    https://github.com/bubble9um/bilibili-dynamic-keyword-blocker
-// @version      1.2.2
+// @version      1.2.3
 // @description  根据自定义关键字屏蔽/隐藏 B 站动态页面内容。支持实时管理关键字、折叠模式（可手动显示并再次隐藏）、正则匹配、导入导出。兼容 BewlyBewly 改版页面。
 // @author       SPARKGUM
 // @homepageURL  https://github.com/bubble9um/bilibili-dynamic-keyword-blocker
@@ -9,8 +9,8 @@
 // @match        https://t.bilibili.com/*
 // @match        https://space.bilibili.com/*/dynamic*
 // @icon         data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='40' fill='%23fb7299'/%3E%3Cline x1='30' y1='30' x2='70' y2='70' stroke='white' stroke-width='8'/%3E%3C/svg%3E
-// @updateURL    https://raw.githubusercontent.com/bubble9um/bilibili-dynamic-keyword-blocker/main/bilibili-dynamic-keyword-blocker.js
-// @downloadURL  https://raw.githubusercontent.com/bubble9um/bilibili-dynamic-keyword-blocker/main/bilibili-dynamic-keyword-blocker.js
+// @updateURL    https://github.com/bubble9um/bilibili-dynamic-keyword-blocker/releases/latest/download/bilibili-dynamic-keyword-blocker.user.js
+// @downloadURL  https://github.com/bubble9um/bilibili-dynamic-keyword-blocker/releases/latest/download/bilibili-dynamic-keyword-blocker.user.js
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
