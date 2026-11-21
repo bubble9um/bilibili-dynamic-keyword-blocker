@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站动态关键字屏蔽器
 // @namespace    https://github.com/bubble9um/bilibili-dynamic-keyword-blocker
-// @version      1.2.3
-// @description  根据自定义关键字屏蔽/隐藏 B 站动态页面内容。支持实时管理关键字、折叠模式（可手动显示并再次隐藏）、正则匹配、导入导出。兼容 BewlyBewly 改版页面。
+// @version      1.2.4
+// @description  根据自定义关键字屏蔽/隐藏 B 站动态页面内容。支持实时管理关键字、折叠模式（可手动显示并再次隐藏）、正则匹配、导入导出。兼容 BewlyBewly 改版页面。修复：首屏误把整个动态列表当成一条动态，导致整页被折叠成一条占位条。
 // @author       SPARKGUM
 // @homepageURL  https://github.com/bubble9um/bilibili-dynamic-keyword-blocker
 // @supportURL   https://github.com/bubble9um/bilibili-dynamic-keyword-blocker/issues
@@ -173,6 +173,36 @@
     return !el || el === document.body || el === document.documentElement;
   }
 
+  // 从链接里取动态 ID（t.bilibili.com/123 / /opus/123 / /dynamic/123）
+  function linkDynId(href) {
+    if (!href) return '';
+    let m = href.match(/\/(?:opus|dynamic)\/(\d{6,})/);
+    if (m) return m[1];
+    m = href.match(/t\.bilibili\.com\/(\d{6,})/);
+    return m ? m[1] : '';
+  }
+
+  // 这块区域里出现了几条「不同」的动态？
+  // 单条动态最多 1 条（转发卡片里引用的原动态链接不算），>=2 就说明它是列表 / 包裹层。
+  // 每轮扫描会重复问到同一些祖先节点，用一个 pass 级别的缓存挡掉重复遍历。
+  let idCache = new WeakMap();
+  function distinctDynIds(el) {
+    const cached = idCache.get(el);
+    if (cached !== undefined) return cached;
+    const ids = new Set();
+    for (const a of el.querySelectorAll('a[href]')) {
+      // 转发卡片里会带被转发动态的链接，不能算数
+      if (a.closest('[class*="forward"], [class*="Forward"], [class*="quote"], [class*="Quote"], blockquote')) continue;
+      const id = linkDynId(a.getAttribute('href') || '');
+      if (!id) continue;
+      ids.add(id);
+      if (ids.size >= 2) break;
+    }
+    const n = ids.size;
+    idCache.set(el, n);
+    return n;
+  }
+
   // 从「正文节点」向上爬，找到那一层「父级里至少还有 1 个同样含正文的兄弟」的元素，
   // 也就是列表中的一条动态卡片（而不是整个列表容器）。
   function discoverByMarker(sel) {
@@ -184,6 +214,8 @@
       while (!isRootish(el) && guard++ < 24) {
         const parent = el.parentElement;
         if (isRootish(parent)) break;
+        // 父级里已经装了「另一条动态」→ 说明 el 已经是单条动态了，再往上就是列表容器
+        if (distinctDynIds(parent) >= 2) break;
         let sibWithMarker = 0;
         let selfIsSib = false;
         for (const c of parent.children) {
@@ -201,32 +233,47 @@
     return Array.from(cards);
   }
 
-  function findCards() {
-    const byClass = Array.from(document.querySelectorAll(CARD_SELECTOR)).filter(el => !isRootish(el));
-    const byMarker = discoverByMarker(MARKER_SELECTOR);
-
-    // 精确类名命中的卡片优先；正文反推命中的节点，若与已知卡片存在包含关系则丢弃
-    const pool = byClass.slice();
-    for (const m of byMarker) {
-      if (byClass.some(c => c.contains(m) || m.contains(c))) continue;
-      if (!pool.includes(m)) pool.push(m);
-    }
-
-    // 兜底：改版页面连已知 class 都没有时，用「空间主页链接」反推卡片
-    const list = pool.length ? pool : discoverByMarker('a[href*="space.bilibili.com"]');
-
+  // 去重 + 只保留最外层（嵌套命中如 .bili-dyn-list__item 里还有 .bili-dyn-item）
+  function outermost(list) {
     const uniq = [];
     for (const el of list) if (!uniq.includes(el)) uniq.push(el);
+    return uniq.filter(el => !uniq.some(o => o !== el && o.contains(el)));
+  }
 
-    // 排除列表容器：内部还套着 >=2 个候选的一定是容器，绝不能动
-    const notContainer = uniq.filter(
-      el => uniq.filter(o => o !== el && el.contains(o)).length < 2
-    );
+  const isPanel = el => el.classList && el.classList.contains('bili-blocker-panel');
 
-    // 嵌套命中（如 .bili-dyn-list__item 里还有 .bili-dyn-item）只保留最外层
-    const final = notContainer.filter(el => !notContainer.some(o => o !== el && o.contains(el)));
+  // 被确认过是「列表容器 / 包裹层」的元素，本页内不再把它当卡片（否则会反复误折叠）
+  const containerSkip = new WeakSet();
 
-    return final.filter(el => !isRootish(el));
+  function findCards() {
+    const byClass = Array.from(document.querySelectorAll(CARD_SELECTOR))
+      .filter(el => !isRootish(el) && !isPanel(el) && !containerSkip.has(el));
+
+    // ① class 命中是权威信号：只要它没装下「两条不同的动态」，就是一张卡片
+    if (byClass.length) {
+      const kept = byClass.filter(el => distinctDynIds(el) < 2);
+      return outermost(kept.length ? kept : byClass);
+    }
+
+    // ② 没有可用的 class（BewlyBewly 等改版 / B站换结构）→ 从正文反推。
+    //    但首屏可能只渲染了 0~1 条动态，这时「卡片」和「列表容器」长得一模一样，
+    //    硬判就会把整个 feed 包裹层当成一条动态 → 全屏占位条 + 白页。
+    //    所以：页面上正文块不足 2 个时，直接不判定，等渲染出来再说。
+    if (document.querySelectorAll(MARKER_SELECTOR).length < 2) return [];
+
+    let byMarker = discoverByMarker(MARKER_SELECTOR).filter(el => !isRootish(el) && !isPanel(el) && !containerSkip.has(el));
+
+    // 兜底：连正文块都没有时，用「空间主页链接」反推
+    if (!byMarker.length) {
+      byMarker = discoverByMarker('a[href*="space.bilibili.com"]')
+        .filter(el => !isRootish(el) && !isPanel(el) && !containerSkip.has(el));
+    }
+
+    // 容器否决：装了两条以上不同动态、或含 2 个以上正文块 → 是列表/包裹层，不是卡片
+    const safe = byMarker.filter(el => distinctDynIds(el) < 2 && el.querySelectorAll(MARKER_SELECTOR).length < 2);
+
+    // 全被判成容器说明这一层确实只是包裹层，宁可这次不屏蔽，也绝不能整页折叠
+    return outermost(safe);
   }
 
   // ===================== 屏蔽处理 =====================
@@ -310,19 +357,16 @@
   // 取动态 ID：优先用「发布时间」链接（t.bilibili.com/123 / /opus/123），
   // 用它来区分「同一条动态内容变了」和「虚拟列表把这个 DOM 节点换成了另一条动态」
   function cardId(card) {
-    const pick = (href) => {
-      const m = href.match(/\/(?:opus|dynamic)\/(\d{6,})/) || href.match(/t\.bilibili\.com\/(\d{6,})/);
-      return m ? m[1] : '';
-    };
     const timeLink = card.querySelector(
       '.bili-dyn-time a[href], [class*="dyn-time"] a[href], [class*="time"] a[href]'
     );
     if (timeLink) {
-      const id = pick(timeLink.getAttribute('href') || '');
+      const id = linkDynId(timeLink.getAttribute('href') || '');
       if (id) return id;
     }
     for (const a of card.querySelectorAll('a[href]')) {
-      const id = pick(a.getAttribute('href') || '');
+      if (a.closest('[class*="forward"], [class*="quote"], blockquote')) continue;
+      const id = linkDynId(a.getAttribute('href') || '');
       if (id) return id;
     }
     return '';
@@ -346,14 +390,29 @@
 
   function processAll(force) {
     if (!document.body) return 0;
+    idCache = new WeakMap();   // DOM 可能变了，本轮的 ID 统计重新算
+
+    // 误判回收：已经被折叠/隐藏、但内部其实是「两条以上不同动态」的元素，说明它是列表容器，
+    // 不是某一条动态 —— 立刻撤回，别让它一直把整页挡住（刷新/点「显示」才能恢复的元凶）
+    document.querySelectorAll('.bili-blocker-collapsed, .bili-blocker-hidden').forEach(el => {
+      if (distinctDynIds(el) < 2) return;
+      containerSkip.add(el);   // 记下来，本页内不再把它当卡片
+      resetCard(el);
+      delete el.dataset.biliClean;
+      delete el.dataset.biliAllow;
+      delete el.dataset.biliSig;
+      cardSnap.delete(el);
+      console.warn('[B站动态关键字屏蔽器] 检测到被误折叠的列表容器，已自动恢复');
+    });
+
     const cards = findCards();
     for (const card of cards) {
       const text = cardText(card);
       const s = sig(text);
       const id = cardId(card);
 
-      // 内容还没渲染出来的空卡片先不判定，等下一轮
-      if (!text && !card.dataset.biliBlocked && !card.dataset.biliAllow) continue;
+      // 内容还没渲染出来 / 被临时清空的先不判定，保持现状，等下一轮
+      if (!text) continue;
 
       // ① 本次会话内被手动「显示」过的动态：一直保持展开。
       //    只有点「重新隐藏」或刷新页面才会失效（评论加载、展开全文、点任何地方都不影响）。
@@ -387,8 +446,9 @@
       const judged = card.dataset.biliBlocked || card.dataset.biliClean;
       if (!force && judged && prev) {
         const sameId = (id && prev.id) ? id === prev.id : null;
-        const sameText = !prev.text || text === prev.text
-          || text.startsWith(prev.text) || prev.text.startsWith(text);
+        // 注意：两边都必须有文本才比较前缀，否则空字符串会「匹配一切」，把误判永久锁死
+        const sameText = !!(prev.text && text) && (text === prev.text
+          || text.startsWith(prev.text) || prev.text.startsWith(text));
         if (sameText || sameId === true) {
           // 屏蔽态下若框架重绘把占位条丢了，补回来
           if (card.dataset.biliBlocked && state.settings.mode === 'collapse'
@@ -603,8 +663,15 @@
     debug: function () {
       const cards = findCards();
       console.log('识别到的动态卡片数量：', cards.length);
+      if (!cards.length) {
+        console.log('（0 条说明结构还没就绪，或 class 变了。页面正文块数量 = ' +
+          document.querySelectorAll(MARKER_SELECTOR).length + '，<2 时脚本会主动跳过判定）');
+      }
       console.log(cards.slice(0, 12).map(c => ({
         class: String(c.className).slice(0, 80),
+        动态数: distinctDynIds(c),
+        正文块: c.querySelectorAll(MARKER_SELECTOR).length,
+        状态: c.dataset.biliBlocked ? '已屏蔽' : (c.dataset.biliAllow ? '已手动显示' : '正常'),
         文本: (c.textContent || '').trim().slice(0, 50),
       })));
       return cards;
